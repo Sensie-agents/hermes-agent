@@ -421,6 +421,19 @@ class ShimHandler(BaseHTTPRequestHandler):
         chunk_index = 0
 
         try:
+            # Initial chunk carries the assistant role (matches live shim wire format)
+            role_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": "claude-cli-opus",
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}
+                ],
+            }
+            self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
             for text, is_done in _invoke_claude_stream(prompt):
                 if is_done:
                     # Send final chunk with finish_reason
@@ -463,11 +476,7 @@ class ShimHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     chunk_index += 1
 
-            # Send [DONE] sentinel
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-
-            # Usage summary chunk
+            # Usage summary chunk — emitted BEFORE [DONE], matching live shim order
             usage_chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -483,6 +492,10 @@ class ShimHandler(BaseHTTPRequestHandler):
             self.wfile.write(
                 f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
             )
+            self.wfile.flush()
+
+            # [DONE] sentinel — final line
+            self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 
         except (BrokenPipeError, ConnectionResetError):

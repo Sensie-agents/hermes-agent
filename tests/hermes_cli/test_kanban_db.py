@@ -51,6 +51,65 @@ def test_init_creates_expected_tables(kanban_home):
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
 
 
+def test_builder_created_reviewer_fanout_under_own_identity_succeeds(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_PROFILE", "builder-gpt5")
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "builder-gpt5")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Review: PR #110",
+            body="Build card: t_build\nPR: https://github.com/example/repo/pull/110",
+            assignee="reviewer-deepseek",
+            created_by="builder-gpt5",
+        )
+        task = kb.get_task(conn, tid)
+        created_events = [e for e in kb.list_events(conn, tid) if e.kind == "created"]
+
+    assert task is not None
+    assert task.assignee == "reviewer-deepseek"
+    assert task.created_by == "builder-gpt5"
+    assert created_events
+    payload = created_events[0].payload
+    assert payload is not None
+    assert payload["review_fanout"] == {
+        "creating_builder": "builder-gpt5",
+        "reviewer": "reviewer-deepseek",
+    }
+
+
+def test_builder_created_by_user_is_denied_even_if_user_allowlisted(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_PROFILE", "builder-gpt5")
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "builder-gpt5")
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="builder workers may only create"):
+            kb.create_task(
+                conn,
+                title="Review: spoofed",
+                assignee="reviewer-deepseek",
+                created_by="user",
+            )
+
+
+def test_builder_non_reviewer_fanout_stays_denied(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "builder-gpt5")
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "builder-gpt5")
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="builder fanout is limited"):
+            kb.create_task(
+                conn,
+                title="Spawn another builder",
+                assignee="builder-claude",
+                created_by="builder-gpt5",
+            )
+
+
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
     """All kanban connections should use the explicit busy-timeout knob.
 

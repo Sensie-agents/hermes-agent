@@ -2193,6 +2193,42 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _current_profile_id() -> Optional[str]:
+    """Return the Hermes profile that is executing this create call, if known."""
+    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _validate_created_by_policy(created_by: Optional[str], assignee: Optional[str]) -> None:
+    """Enforce the narrow builder → reviewer fanout capability.
+
+    The DB trigger is the hard floor for broad allowlist enforcement, but it
+    cannot know which profile is making the call.  This source-layer check
+    closes the authority-leak hole: a builder process may not stamp cards as
+    ``user``/``ceo``/``Claude-CoS`` (or any identity other than itself).  The
+    only builder-created fanout we grant is the cross-model review handoff.
+    """
+    caller = _current_profile_id()
+    if not caller or not caller.startswith("builder-"):
+        return
+
+    creator = (created_by or "").strip()
+    target = (assignee or "").strip()
+    if creator != caller:
+        raise ValueError(
+            f"created_by={creator!r} denied for builder caller {caller!r}; "
+            "builder workers may only create cards under their own profile id"
+        )
+    if not target.startswith("reviewer-"):
+        raise ValueError(
+            f"assignee={target!r} denied for builder caller {caller!r}; "
+            "builder fanout is limited to reviewer-* cards"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2242,6 +2278,7 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    _validate_created_by_policy(created_by, assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2410,19 +2447,32 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                created_payload = {
+                    "assignee": assignee,
+                    "status": task_status,
+                    "parents": list(parents),
+                    "tenant": tenant,
+                    "branch_name": branch_name,
+                    "skills": list(skills_list) if skills_list else None,
+                    "goal_mode": bool(goal_mode) or None,
+                }
+                caller = _current_profile_id()
+                if (
+                    caller
+                    and caller.startswith("builder-")
+                    and created_by == caller
+                    and assignee
+                    and assignee.startswith("reviewer-")
+                ):
+                    created_payload["review_fanout"] = {
+                        "creating_builder": caller,
+                        "reviewer": assignee,
+                    }
                 _append_event(
                     conn,
                     task_id,
                     "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "tenant": tenant,
-                        "branch_name": branch_name,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                    },
+                    created_payload,
                 )
             return task_id
         except sqlite3.IntegrityError:

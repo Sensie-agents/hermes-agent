@@ -1197,6 +1197,36 @@ def test_recompute_ready_emits_promoted_not_ready(kanban_home):
         conn.close()
 
 
+def test_recompute_ready_skips_cleanup_audit_blocked_tasks(kanban_home):
+    """CoS cleanup holds are explicit operator gates, not parent deps.
+
+    ``recompute_ready`` intentionally auto-promotes blocked tasks whose only
+    blocker was an unfinished parent. After protocol-violation cleanup, though,
+    the row is blocked with a stable ``last_failure_error`` starting with
+    ``cleanup audit:``. Those rows must stay blocked until an operator or review
+    result explicitly unblocks them.
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="p")
+        child = kb.create_task(conn, title="cleanup-held", parents=[parent])
+        kb.block_task(conn, child, reason="initial dependency block")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', last_failure_error=? WHERE id=?",
+            ("cleanup audit: review routed; keep blocked", child),
+        )
+        conn.commit()
+        kb.complete_task(conn, parent, result="ok")
+        kb.recompute_ready(conn)
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+        kinds = [e.kind for e in kb.list_events(conn, child)]
+        assert "promoted" not in kinds
+    finally:
+        conn.close()
+
+
 def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_spawnable):
     def _bad(task, ws):
         raise RuntimeError("nope")

@@ -22,9 +22,210 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+import json
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+
+
+_KANBAN_COMPLETE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "kanban_complete",
+        "description": "Mark the active kanban task complete with a concise summary.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "metadata": {"type": "object"},
+                "created_cards": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["summary"],
+        },
+    },
+}
+
+_KANBAN_BLOCK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "kanban_block",
+        "description": "Block the active kanban task with a concise reason.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+            },
+            "required": ["reason"],
+        },
+    },
+}
+
+
+def _kanban_task_status(task_id: str) -> str | None:
+    """Return the current kanban task status, best-effort."""
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect()
+    try:
+        task = _kb.get_task(conn, task_id)
+        return getattr(task, "status", None) if task else None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _record_incomplete_kanban_failure(agent, task_id: str, api_call_count: int, logger) -> None:
+    """Record an incomplete worker run through the kanban failure counter."""
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect()
+    try:
+        _kb._record_task_failure(
+            conn,
+            task_id,
+            error=(
+                "Kanban worker produced a normal final response while the "
+                "task was still running, and the forced lifecycle follow-up "
+                "did not close it"
+            ),
+            outcome="incomplete",
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"api_calls": api_call_count},
+        )
+        logger.info("recorded incomplete kanban failure for task %s", task_id)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _force_kanban_terminal_tool_call(agent, *, task_id: str, messages: list, final_response: str | None, effective_task_id: str, logger) -> bool:
+    """Give a kanban worker one constrained chance to close/block its task.
+
+    Normal text completion from a dispatcher-spawned worker used to let the
+    process exit rc=0 while the task row stayed ``running``. The dispatcher only
+    noticed after-the-fact and force-blocked the card as a protocol violation.
+    This helper mirrors the budget-exhaustion safety net, but preserves model
+    agency first: one extra request exposes ONLY kanban_complete and
+    kanban_block and uses required tool choice. If the model emits a lifecycle
+    call and the task leaves ``running``, we are done. Otherwise the caller
+    records a real ``outcome="incomplete"`` failure.
+    """
+    if _kanban_task_status(task_id) != "running":
+        return True
+
+    if getattr(agent, "api_mode", None) == "bedrock_converse":
+        # Bedrock Converse does not accept OpenAI-format forced tool-choice
+        # kwargs (``tool_choice='required'`` / ``parallel_tool_calls=False``),
+        # and its transport exposes conversion helpers rather than a generic
+        # ``create`` method. Until a Bedrock-native constrained lifecycle call
+        # is implemented and covered, deliberately fall back to the existing
+        # kanban failure counter instead of silently pretending the safety net
+        # ran. The caller records ``outcome='incomplete'`` with claim release.
+        logger.warning(
+            "skipping forced kanban lifecycle follow-up for bedrock_converse task %s; "
+            "recording incomplete fallback",
+            task_id,
+        )
+        return False
+
+    forced_messages = list(messages)
+    forced_messages.append({
+        "role": "user",
+        "content": (
+            "Your previous final answer ended while this kanban task is still "
+            "RUNNING. You must now call exactly one lifecycle tool. If the work "
+            "is finished, call kanban_complete with a concise summary. If it is "
+            "not finished or needs input, call kanban_block with a concise reason. "
+            "Do not answer conversationally."
+        ),
+    })
+
+    original_tools = getattr(agent, "tools", None)
+    original_valid = getattr(agent, "valid_tool_names", None)
+    try:
+        agent.tools = [_KANBAN_COMPLETE_TOOL, _KANBAN_BLOCK_TOOL]
+        agent.valid_tool_names = {"kanban_complete", "kanban_block"}
+        api_kwargs = agent._build_api_kwargs(agent._sanitize_api_messages(forced_messages))
+        api_kwargs["tools"] = agent.tools
+        api_kwargs["tool_choice"] = "required"
+        api_kwargs["parallel_tool_calls"] = False
+
+        if agent.api_mode == "anthropic_messages":
+            response = agent._anthropic_messages_create(api_kwargs)
+            normalized = agent._get_transport().normalize_response(
+                response,
+                strip_tool_prefix=agent._is_anthropic_oauth,
+            )
+        elif agent.api_mode == "codex_responses":
+            response = agent._run_codex_stream(api_kwargs)
+            normalized = agent._get_transport().normalize_response(response)
+        else:
+            response = agent._ensure_primary_openai_client(
+                reason="kanban_normal_exit_lifecycle"
+            ).chat.completions.create(**api_kwargs)
+            normalized = agent._get_transport().normalize_response(response)
+
+        tool_calls = list(getattr(normalized, "tool_calls", None) or [])
+        allowed = {"kanban_complete", "kanban_block"}
+        tool_calls = [tc for tc in tool_calls if getattr(tc, "function", tc).name in allowed]
+        if not tool_calls:
+            logger.warning("forced kanban lifecycle call produced no lifecycle tool call for %s", task_id)
+            return False
+
+        # Dispatch at most one terminal lifecycle call. The constrained tool
+        # schema should prevent extras, but limiting here keeps the safety net
+        # single-purpose and avoids double-closing.
+        tc = tool_calls[0]
+        assistant_msg = agent._build_assistant_message(normalized, "tool_calls")
+        messages.append({"role": "user", "content": forced_messages[-1]["content"]})
+        messages.append(assistant_msg)
+
+        function_name = getattr(tc, "function", tc).name
+        function_args = getattr(tc, "function", tc).arguments
+        try:
+            parsed_args = json.loads(function_args or "{}")
+        except Exception:
+            parsed_args = {}
+
+        from run_agent import handle_function_call
+
+        result = handle_function_call(
+            function_name,
+            parsed_args,
+            effective_task_id,
+            tool_call_id=getattr(tc, "id", None) or "kanban_lifecycle_finalizer",
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            enabled_tools=["kanban_complete", "kanban_block"],
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            tool_request_middleware_trace=[],
+        )
+        messages.append({
+            "role": "tool",
+            "tool_call_id": getattr(tc, "id", None) or "kanban_lifecycle_finalizer",
+            "content": result if isinstance(result, str) else str(result),
+        })
+        closed = _kanban_task_status(task_id) != "running"
+        if closed:
+            logger.info("forced kanban lifecycle call closed task %s via %s", task_id, function_name)
+        else:
+            logger.warning("forced kanban lifecycle call did not close task %s", task_id)
+        return closed
+    finally:
+        agent.tools = original_tools
+        agent.valid_tool_names = original_valid
 
 
 def finalize_turn(
@@ -117,6 +318,59 @@ def finalize_turn(
             except Exception:
                 logger.warning(
                     "Failed to record budget-exhausted failure for task %s",
+                    _kanban_task,
+                    exc_info=True,
+                )
+
+    # Normal kanban-worker exit safety net. Budget exhaustion already has a
+    # direct DB failure bridge above because tools are stripped for the summary
+    # call. The sibling failure mode is a worker that produces a normal final
+    # response and exits rc=0 while the task row is still ``running`` because it
+    # never called kanban_complete/kanban_block. Catch that before the process
+    # exits: give the model one constrained lifecycle-tool follow-up, then fall
+    # back to a counted ``outcome="incomplete"`` failure if it still fails.
+    _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+    _normal_exit = (
+        final_response is not None
+        and api_call_count < agent.max_iterations
+        and (agent.iteration_budget.remaining if agent.iteration_budget else 1) > 0
+        and not interrupted
+        and not failed
+    )
+    if _kanban_task and _normal_exit:
+        try:
+            if _kanban_task_status(_kanban_task) == "running":
+                closed = _force_kanban_terminal_tool_call(
+                    agent,
+                    task_id=_kanban_task,
+                    messages=messages,
+                    final_response=final_response,
+                    effective_task_id=effective_task_id,
+                    logger=logger,
+                )
+                if not closed:
+                    _record_incomplete_kanban_failure(
+                        agent,
+                        _kanban_task,
+                        api_call_count,
+                        logger,
+                    )
+        except Exception:
+            logger.warning(
+                "Failed to force normal-exit kanban lifecycle tool for task %s",
+                _kanban_task,
+                exc_info=True,
+            )
+            try:
+                _record_incomplete_kanban_failure(
+                    agent,
+                    _kanban_task,
+                    api_call_count,
+                    logger,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to record incomplete kanban failure for task %s",
                     _kanban_task,
                     exc_info=True,
                 )

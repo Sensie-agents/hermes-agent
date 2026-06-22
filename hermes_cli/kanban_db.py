@@ -217,6 +217,150 @@ _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
+# Cross-model review gate: reviewer profiles in rotation order.
+# When a builder task needs review, the dispatcher picks the first reviewer
+# whose model differs from the builder's model. If all reviewers share the
+# same model as the builder, the task is surfaced for manual review.
+_CROSS_MODEL_REVIEWER_ROTATION = [
+    "reviewer-deepseek",
+    "reviewer-qwen",
+    "reviewer-minimax",
+]
+
+# reviewer profiles mapped to their actual profile directory names.
+# The dispatcher resolves each profile's EFFECTIVE model by calling the
+# same runtime provider resolution path the agent uses at startup —
+# pool-aware, not just reading config.yaml's model.default (which credential
+# pools, fallback_providers, and profile .env files can override at runtime).
+
+
+def _resolve_profile_model(profile_name: Optional[str]) -> Optional[str]:
+    """Return the **effective** model for a profile (pool-aware), or None.
+
+    Does NOT read ``model.default`` from config.yaml directly — on this
+    fleet the credential pool, ``fallback_providers``, and profile ``.env``
+    files can all override the config at runtime, so a static config read
+    can lie.  Instead resolves the model the same way the agent runtime
+    does: call ``resolve_runtime_provider()`` with the profile's
+    ``HERMES_HOME`` temporarily set, then derive the model from the
+    runtime's ``model`` field, config's ``model.default``, or the
+    provider's catalog default — in that order.
+
+    Resolves at call-time (not import-time) so profile config / pool
+    changes are picked up without a gateway restart.  Returns ``None``
+    when the profile directory or config is missing or unparseable, or
+    when the effective model cannot be determined — the caller decides
+    how to treat an unresolvable model (conservative default: treat as
+    same-model and escalate).
+    """
+    if not profile_name or not profile_name.strip():
+        return None
+    name = profile_name.strip()
+    try:
+        profile_home = Path.home() / ".hermes" / "profiles" / name
+        if not profile_home.is_dir():
+            return None
+
+        old_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(profile_home)
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            config = load_config()
+            model_cfg = config.get("model", {})
+            if not isinstance(model_cfg, dict):
+                return str(model_cfg).strip() or None
+
+            config_model = (model_cfg.get("default") or "").strip()
+            config_provider = (model_cfg.get("provider") or "").strip()
+
+            # Resolve the pool-aware effective provider + model.
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=config_provider if config_provider else None,
+                )
+            except Exception:
+                runtime = {}
+
+            # Model precedence: custom_providers model → config default
+            # → provider's catalog default.
+            runtime_model = runtime.get("model")
+            if runtime_model and isinstance(runtime_model, str) and runtime_model.strip():
+                return runtime_model.strip()
+
+            if config_model:
+                return config_model
+
+            effective_provider = runtime.get("provider", "")
+            if effective_provider:
+                try:
+                    from hermes_cli.models import get_default_model_for_provider
+                    default = get_default_model_for_provider(effective_provider)
+                    if default and isinstance(default, str) and default.strip():
+                        return default.strip()
+                except Exception:
+                    pass
+
+            return None
+        finally:
+            if old_home is not None:
+                os.environ["HERMES_HOME"] = old_home
+            else:
+                os.environ.pop("HERMES_HOME", None)
+    except Exception:
+        return None
+
+
+def _resolve_builder_model(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the model of the profile that *built* the original task.
+
+    The builder is identified by ``tasks.created_by`` on the original
+    (non-review) task. For review tasks (title starts with ``Review:``),
+    ``created_by`` is the profile that created the review task — usually
+    the builder itself or the review-gate dispatcher. We walk back to the
+    original build task and resolve ITS ``created_by``.
+    """
+    row = conn.execute(
+        "SELECT created_by FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or not row["created_by"]:
+        return None
+    builder_profile = row["created_by"]
+    return _resolve_profile_model(builder_profile)
+
+
+def _find_cross_model_reviewer(
+    current_assignee: str,
+    builder_model: str,
+) -> Optional[str]:
+    """Return the first reviewer in rotation whose model differs from
+    ``builder_model``, or ``None`` when every reviewer lane maps to the
+    same model.
+
+    Starts the search at the slot *after* ``current_assignee`` in
+    ``_CROSS_MODEL_REVIEWER_ROTATION`` so the rotation makes forward
+    progress (no ping-pong). Wraps around. The per-call config read
+    means a profile config change picked up between ticks automatically
+    unblocks a same-model cohort without a gateway restart.
+    """
+    if not current_assignee:
+        return None
+    rotation = _CROSS_MODEL_REVIEWER_ROTATION
+    try:
+        idx = rotation.index(current_assignee)
+    except ValueError:
+        idx = -1  # assignee not in rotation — start from beginning
+    # Search forward, wrapping around, excluding the current slot.
+    for offset in range(1, len(rotation)):
+        candidate = rotation[(idx + offset) % len(rotation)]
+        model = _resolve_profile_model(candidate)
+        if model is not None and model != builder_model:
+            return candidate
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -2914,12 +3058,18 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, last_failure_error "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if str(row["last_failure_error"] or "").startswith("cleanup audit:"):
+                # Operator/CoS cleanup explicitly reclassified this row away
+                # from a transient harness failure into a real gate/review hold.
+                # Do not auto-promote it just because its parents are done; an
+                # explicit unblock/requeue is required.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4912,6 +5062,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    same_model_reviewer: list[str] = field(default_factory=list)
+    """Review task ids skipped because the reviewer's model is identical to
+    the builder's model (cross-model review gate). Surfaces the enforcement
+    gap to telemetry so operators can see when a review-gate violation was
+    caught. These tasks need a cross-model (different model) reviewer before
+    they can be dispatched."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6362,6 +6518,55 @@ def dispatch_once(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # ── Cross-model review gate ────────────────────────────────────
+        # Require reviewer-model != builder-model (not just lane != lane).
+        # Two different lanes can map to the same model (e.g.
+        # builder-deepseek + reviewer-deepseek both use deepseek-v4-pro),
+        # which defeats the cross-model review intent. Resolve each lane's
+        # model.default from config.yaml at review-time so config changes
+        # are picked up without a gateway restart.
+        reviewer_model = _resolve_profile_model(row["assignee"])
+        builder_model = _resolve_builder_model(conn, row["id"])
+        # Cross-model review gate: when both profiles exist on disk and
+        # their models can be resolved, require reviewer-model !=
+        # builder-model. If either profile or model is unresolvable (e.g.
+        # in tests with fake assignee names), skip the gate — we cannot
+        # enforce what we cannot measure.
+        if (reviewer_model is not None and builder_model is not None
+                and reviewer_model == builder_model):
+            # Try the next reviewer in rotation (wrap around).
+            alt = _find_cross_model_reviewer(row["assignee"], builder_model)
+            if alt is not None:
+                _log.info(
+                    "kanban review gate: auto-rotating reviewer — "
+                    "task=%s from=%s to=%s (same model=%s)",
+                    row["id"], row["assignee"], alt, builder_model,
+                )
+                # Persist the reassignment so the board state is
+                # consistent and the task picks up where the rotation
+                # left off on the next tick.
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET assignee = ? WHERE id = ?",
+                        (alt, row["id"]),
+                    )
+                    _append_event(
+                        conn, row["id"], "auto_rotated_reviewer",
+                        {"from": row["assignee"], "to": alt,
+                         "reason": f"same-model: {builder_model}"},
+                    )
+                row = dict(row)
+                row["assignee"] = alt
+            else:
+                _log.warning(
+                    "kanban review gate: same-model review blocked — "
+                    "no cross-model reviewer available. "
+                    "task=%s builder_model=%s reviewer=%s reviewer_model=%s",
+                    row["id"], builder_model, row["assignee"],
+                    reviewer_model,
+                )
+                result.same_model_reviewer.append(row["id"])
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue

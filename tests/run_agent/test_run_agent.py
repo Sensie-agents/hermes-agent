@@ -4518,6 +4518,126 @@ class TestRunConversation:
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
+    def test_kanban_normal_text_exit_forces_lifecycle_tool(self, agent, monkeypatch):
+        """A kanban worker that answers normally without complete/block gets
+        one forced lifecycle follow-up before the process exits.
+
+        Regression for the rc=0 protocol-violation loop: the worker produced a
+        final response, exited cleanly, and only the dispatcher noticed later
+        that the task row was still ``running``. Reverting the normal-exit
+        finalizer bridge should make this test fail because the second API call
+        and kanban_complete dispatch disappear.
+        """
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_456")
+
+        normal_resp = _mock_response(content="Done, wrote the report.", finish_reason="stop")
+        lifecycle_tc = _mock_tool_call(
+            name="kanban_complete",
+            arguments=json.dumps({"summary": "report complete"}),
+            call_id="kc1",
+        )
+        lifecycle_resp = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[lifecycle_tc],
+        )
+        agent.client.chat.completions.create.side_effect = [normal_resp, lifecycle_resp]
+
+        with (
+            patch("agent.turn_finalizer._kanban_task_status", side_effect=["running", "running", "done"]),
+            patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 2
+        forced_kwargs = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert forced_kwargs["tool_choice"] == "required"
+        assert [t["function"]["name"] for t in forced_kwargs["tools"]] == [
+            "kanban_complete",
+            "kanban_block",
+        ]
+        mock_handle.assert_called_once()
+        assert mock_handle.call_args.args[0] == "kanban_complete"
+        assert mock_handle.call_args.args[1]["summary"] == "report complete"
+
+    def test_kanban_normal_text_exit_records_incomplete_if_forced_call_fails(self, agent, monkeypatch):
+        """If the forced lifecycle request still does not close the task,
+        the finalizer records a counted incomplete failure.
+        """
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_789")
+
+        normal_resp = _mock_response(content="Done, but no tool.", finish_reason="stop")
+        bad_resp = _mock_response(content="I am done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [normal_resp, bad_resp]
+
+        mock_record_failure = MagicMock(return_value=False)
+        mock_connect = MagicMock(return_value=MagicMock())
+
+        with (
+            patch("agent.turn_finalizer._kanban_task_status", return_value="running"),
+            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
+            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 2
+        mock_record_failure.assert_called_once()
+        call = mock_record_failure.call_args
+        assert call.args[1] == "t_test_task_789"
+        assert call.kwargs["outcome"] == "incomplete"
+        assert call.kwargs["release_claim"] is True
+        assert call.kwargs["end_run"] is True
+
+    def test_kanban_bedrock_normal_text_exit_uses_incomplete_fallback(self, agent, monkeypatch):
+        """Bedrock cannot use the OpenAI-format forced tool-choice shim.
+
+        The normal-exit safety net must therefore fall back to the counted
+        ``outcome='incomplete'`` path instead of calling a nonexistent
+        BedrockTransport.create() or passing OpenAI-only kwargs to Converse.
+        """
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_bedrock")
+
+        normal_resp = _mock_response(content="Done, but no lifecycle tool.", finish_reason="stop")
+
+        def _first_call_then_bedrock(*args, **kwargs):
+            agent.api_mode = "bedrock_converse"
+            return normal_resp
+
+        agent.client.chat.completions.create.side_effect = _first_call_then_bedrock
+
+        mock_record_failure = MagicMock(return_value=False)
+        mock_connect = MagicMock(return_value=MagicMock())
+
+        with (
+            patch("agent.turn_finalizer._kanban_task_status", return_value="running"),
+            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
+            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 1
+        mock_record_failure.assert_called_once()
+        call = mock_record_failure.call_args
+        assert call.args[1] == "t_test_task_bedrock"
+        assert call.kwargs["outcome"] == "incomplete"
+        assert call.kwargs["release_claim"] is True
+        assert call.kwargs["end_run"] is True
+
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
         is unset (non-kanban runs are unaffected by #29747 gap 2)."""

@@ -1050,10 +1050,6 @@ KANBAN_SHOW_SCHEMA = {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
             },
-            "receipt": {
-                "type": "string",
-                "description": "Runnable Demonstrated Done receipt. Required when the card body contains `Verifiable by:`; data-landing receipts must include a real SELECT/read-back with rows>=1.",
-            },
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -1190,6 +1186,22 @@ KANBAN_COMPLETE_SCHEMA = {
                     "are not the deliverable. The path must exist "
                     "on disk when the notifier runs; missing files "
                     "are silently skipped."
+                ),
+            },
+            "receipt": {
+                "type": "string",
+                "description": (
+                    "Runnable Demonstrated Done receipt. Required when the "
+                    "card body contains `Verifiable by:`; data-landing "
+                    "receipts must include a real SELECT/read-back with "
+                    "rows>=1. Alias: demonstrated_done_receipt."
+                ),
+            },
+            "demonstrated_done_receipt": {
+                "type": "string",
+                "description": (
+                    "Alias for receipt. Use this for explicitness when "
+                    "attaching the runnable Demonstrated Done receipt."
                 ),
             },
             "board": _board_schema_prop(),

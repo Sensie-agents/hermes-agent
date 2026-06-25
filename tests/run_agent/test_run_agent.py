@@ -4673,6 +4673,70 @@ class TestRunConversation:
             "_record_task_failure should not be called outside kanban mode"
         )
 
+    def test_kanban_lifecycle_translates_tool_choice_for_anthropic(self, agent, monkeypatch):
+        """The forced lifecycle follow-up translates OpenAI tool_choice='required'
+        to Anthropic format {'type': 'any'} and strips parallel_tool_calls.
+
+        Regression: _force_kanban_terminal_tool_call passed the OpenAI-format
+        string 'required' directly to _anthropic_messages_create. The Anthropic
+        SDK doesn't recognise that format and silently defaults to auto behaviour,
+        allowing the model to return a text response instead of a lifecycle tool
+        call.  This caused every anthropic_messages kanban worker to fail the
+        forced lifecycle follow-up with "did not close it".
+        """
+        from agent.turn_finalizer import _force_kanban_terminal_tool_call
+
+        self._setup_agent(agent)
+        agent.api_mode = "anthropic_messages"
+        agent._sanitize_api_messages = lambda msgs: msgs
+        agent._build_api_kwargs = lambda msgs: {"model": "test", "messages": msgs}
+        # _get_transport is called by the anthropic_messages path.
+        mock_transport = MagicMock()
+        lifecycle_tc = SimpleNamespace(
+            id="kc_anthro", type="function",
+            function=SimpleNamespace(
+                name="kanban_complete",
+                arguments=json.dumps({"summary": "fixed"}),
+            ),
+        )
+        mock_transport.normalize_response.return_value = SimpleNamespace(
+            content="",
+            tool_calls=[lifecycle_tc],
+        )
+        agent._get_transport = MagicMock(return_value=mock_transport)
+
+        mock_anthro_create = MagicMock(return_value=MagicMock())
+        agent._anthropic_messages_create = mock_anthro_create
+
+        with (
+            patch("agent.turn_finalizer._kanban_task_status",
+                  side_effect=["running", "done"]),
+            patch("run_agent.handle_function_call", return_value='{"ok": true}'),
+        ):
+            closed = _force_kanban_terminal_tool_call(
+                agent,
+                task_id="t_test_anthro",
+                messages=[{"role": "user", "content": "do the work"}],
+                final_response="Done.",
+                effective_task_id="t_test_anthro",
+                logger=MagicMock(),
+            )
+
+        assert closed is True
+        mock_anthro_create.assert_called_once()
+        forced_kwargs = mock_anthro_create.call_args.args[0]
+        # tool_choice must be Anthropic format, not OpenAI format.
+        assert forced_kwargs["tool_choice"] == {"type": "any"}, (
+            f"Expected Anthropic tool_choice, got: {forced_kwargs.get('tool_choice')}"
+        )
+        # parallel_tool_calls must NOT leak into the Anthropic call.
+        assert "parallel_tool_calls" not in forced_kwargs, (
+            "parallel_tool_calls leaked into Anthropic kwargs"
+        )
+        assert [t["function"]["name"] for t in forced_kwargs["tools"]] == [
+            "kanban_complete", "kanban_block",
+        ]
+
 
 class TestHookPayloadSanitizesSimpleNamespace:
     """Regression: ``_hook_jsonable`` referenced ``SimpleNamespace`` without

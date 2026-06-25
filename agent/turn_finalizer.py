@@ -159,12 +159,24 @@ def _force_kanban_terminal_tool_call(agent, *, task_id: str, messages: list, fin
         api_kwargs["parallel_tool_calls"] = False
 
         if agent.api_mode == "anthropic_messages":
+            # Translate OpenAI-format tool_choice to Anthropic format.
+            # The Anthropic SDK expects ``{"type": "any"}``, not ``"required"``.
+            # ``parallel_tool_calls`` is an OpenAI Responses-only kwarg and
+            # gets stripped by ``sanitize_anthropic_kwargs`` inside
+            # ``_anthropic_messages_create``; we translate it to the
+            # Anthropic-native ``tool_choice`` constraint here so both the
+            # constraint AND the sanitization are handled in one place.
+            api_kwargs["tool_choice"] = {"type": "any"}
+            api_kwargs.pop("parallel_tool_calls", None)
             response = agent._anthropic_messages_create(api_kwargs)
             normalized = agent._get_transport().normalize_response(
                 response,
                 strip_tool_prefix=agent._is_anthropic_oauth,
             )
         elif agent.api_mode == "codex_responses":
+            # The OpenAI Responses API accepts ``tool_choice="required"``
+            # in the same format as Chat Completions.  ``parallel_tool_calls``
+            # is a Responses-native constraint and stays.
             response = agent._run_codex_stream(api_kwargs)
             normalized = agent._get_transport().normalize_response(response)
         else:
